@@ -1,0 +1,22 @@
+# Local virtual environments
+venv/
+.venv/
+ENV/
+
+# IDE configurations
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Diagnostic/AI tool folders
+.qodo/
+.sixth/
+
+# GCP Credentials (private keys)
+gcp-service-account-key.json
+Jugaad app/Jugaad app/jugaad_backend/gcp-service-account-key.json
+
+# OS files
+.DS_Store
+Thumbs.db
