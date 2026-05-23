@@ -1,19 +1,85 @@
-name: Jugaad CI/CD Pipeline
+name: Jugaad CI/CD Pipeline (GAR & Cloud Run)
 
 on:
   push:
     branches:
       - main
 
-# Ensure permissions are configured correctly for GCP authentication
+# Configure environment variables for easy adjustments
+env:
+  GAR_REPO_NAME: jugaad-repo # Name of your Google Artifact Registry repository
+
 permissions:
   contents: read
   id-token: write
 
 jobs:
-  deploy:
-    name: Build, Push and Deploy Jugaad Services
+  # ============================================================================
+  # STAGE 1: Parallel Build and Push to Google Artifact Registry
+  # ============================================================================
+  build-and-push:
+    name: Build & Push
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        service:
+          - { folder: "auth_service", name: "auth-service" }
+          - { folder: "worker_service", name: "worker-service" }
+          - { folder: "user_service", name: "user-service" }
+          - { folder: "admin_service", name: "admin-service" }
+          - { folder: "booking_service", name: "booking-service" }
+          - { folder: "payment_service", name: "payment-service" }
+          - { folder: "review_service", name: "review-service" }
+          - { folder: "matching_service", name: "matching-service" }
+          - { folder: "notification_service", name: "notification-service" }
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.GCP_REGION }}-docker.pkg.dev
+          username: _json_key
+          password: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: Jugaad app/Jugaad app/jugaad_backend
+          file: Jugaad app/Jugaad app/jugaad_backend/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPO_NAME }}/jugaad-${{ matrix.service.name }}:${{ github.sha }}
+            ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPO_NAME }}/jugaad-${{ matrix.service.name }}:latest
+
+  # ============================================================================
+  # STAGE 2: Parallel Deploy to Google Cloud Run (Requires successful builds)
+  # ============================================================================
+  deploy:
+    name: Deploy
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true # Instantly abort remaining active jobs in matrix if one fails
+      matrix:
+        service:
+          - { folder: "auth_service", name: "auth-service" }
+          - { folder: "worker_service", name: "worker-service" }
+          - { folder: "user_service", name: "user-service" }
+          - { folder: "admin_service", name: "admin-service" }
+          - { folder: "booking_service", name: "booking-service" }
+          - { folder: "payment_service", name: "payment-service" }
+          - { folder: "review_service", name: "review-service" }
+          - { folder: "matching_service", name: "matching-service" }
+          - { folder: "notification_service", name: "notification-service" }
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -29,116 +95,45 @@ jobs:
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      - name: Configure Docker for GCR
+      - name: Deploy to Google Cloud Run
         run: |
-          gcloud auth configure-docker --quiet
+          IMAGE_TAG="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPO_NAME }}/jugaad-${{ matrix.service.name }}:${{ github.sha }}"
+          
+          echo "🚀 Deploying jugaad-${{ matrix.service.name }} using image ${IMAGE_TAG}..."
+          
+          gcloud run deploy "jugaad-${{ matrix.service.name }}" \
+            --image "${IMAGE_TAG}" \
+            --region "${{ secrets.GCP_REGION }}" \
+            --platform managed \
+            --ingress internal-and-cloud-load-balancing \
+            --no-allow-unauthenticated \
+            --set-env-vars "SERVICE_NAME=${{ matrix.service.folder }}" \
+            --min-instances 1 \
+            --max-instances 10 \
+            --memory 512Mi \
+            --cpu 1 \
+            --timeout 300s \
+            --liveness-probe-path "/health" \
+            --liveness-probe-failure-threshold 3 \
+            --quiet
+            
+          echo "✅ Successfully deployed jugaad-${{ matrix.service.name }}!"
 
-      - name: Build Unified Base Docker Image
-        # We build the image once since all services share the same Dockerfile
-        # The specific service is run dynamically via the SERVICE_NAME environment variable
+  # ============================================================================
+  # STAGE 3: Failure Notification & Summary (Runs only on pipeline failures)
+  # ============================================================================
+  notify-failure:
+    name: Pipeline Failure Summary
+    needs: [build-and-push, deploy]
+    runs-on: ubuntu-latest
+    if: failure()
+    steps:
+      - name: Post Failure Notification to Job Summary
         run: |
-          docker build \
-            -t jugaad-base \
-            -f "Jugaad app/Jugaad app/jugaad_backend/Dockerfile" \
-            "Jugaad app/Jugaad app/jugaad_backend"
-
-      - name: Tag, Push & Deploy to Cloud Run
-        env:
-          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          REGION: asia-south1
-        run: |
-          set -e
-          
-          # Initialize GHA Job Summary with a clean title
-          echo "## 🚀 Jugaad Deployment Run Summary" >> $GITHUB_STEP_SUMMARY
-          echo "Deploying 9 microservices to Cloud Run..." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # List of services to deploy: <hyphenated-name>:<underscored-name>
-          SERVICES=(
-            "auth-service:auth_service"
-            "worker-service:worker_service"
-            "user-service:user_service"
-            "admin-service:admin_service"
-            "booking-service:booking_service"
-            "payment-service:payment_service"
-            "review-service:review_service"
-            "matching-service:matching_service"
-            "notification-service:notification_service"
-          )
-          
-          for service_pair in "${SERVICES[@]}"; do
-            SERVICE_HYPHEN="${service_pair%%:*}"
-            SERVICE_UNDERSCORE="${service_pair#*:}"
-            
-            IMAGE_TAG="gcr.io/${PROJECT_ID}/jugaad-${SERVICE_HYPHEN}:${{ github.sha }}"
-            IMAGE_LATEST="gcr.io/${PROJECT_ID}/jugaad-${SERVICE_HYPHEN}:latest"
-            
-            echo "============================================================"
-            echo "👉 Processing Service: jugaad-${SERVICE_HYPHEN}"
-            echo "============================================================"
-            
-            # Tag the base image for this service
-            docker tag jugaad-base "${IMAGE_TAG}"
-            docker tag jugaad-base "${IMAGE_LATEST}"
-            
-            # Push images to GCR
-            echo "Pushing images to GCR..."
-            if ! docker push "${IMAGE_TAG}" || ! docker push "${IMAGE_LATEST}"; then
-              echo "❌ Failed to push GCR image for ${SERVICE_HYPHEN}"
-              echo "### ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
-              echo "Reason: Failed to push GCR image for **jugaad-${SERVICE_HYPHEN}**." >> $GITHUB_STEP_SUMMARY
-              exit 1
-            fi
-            
-            # Deploy to Google Cloud Run
-            echo "Deploying to Google Cloud Run..."
-            if ! gcloud run deploy "jugaad-${SERVICE_HYPHEN}" \
-              --image "${IMAGE_TAG}" \
-              --region "${REGION}" \
-              --platform managed \
-              --ingress internal-and-cloud-load-balancing \
-              --no-allow-unauthenticated \
-              --set-env-vars "SERVICE_NAME=${SERVICE_UNDERSCORE}" \
-              --min-instances 1 \
-              --max-instances 10 \
-              --memory 512Mi \
-              --cpu 1 \
-              --timeout 300s \
-              --liveness-probe-path "/health" \
-              --liveness-probe-failure-threshold 3 \
-              --quiet; then
-              
-              echo "❌ Failed to deploy jugaad-${SERVICE_HYPHEN} to Cloud Run"
-              echo "### ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
-              echo "Reason: Cloud Run deployment failed for **jugaad-${SERVICE_HYPHEN}**." >> $GITHUB_STEP_SUMMARY
-              exit 1
-            fi
-            
-            echo "✅ Successfully deployed jugaad-${SERVICE_HYPHEN}!"
-            echo "- ✅ **jugaad-${SERVICE_HYPHEN}** deployed successfully." >> $GITHUB_STEP_SUMMARY
-          done
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "🎉 **All 9 microservices deployed successfully!**" >> $GITHUB_STEP_SUMMARY
-
-      - name: Notification on Pipeline Failure
-        if: failure()
-        # This step triggers only if any of the prior steps (auth, build, or deploy) fail.
-        # It adds a prominent warning to the GitHub Actions workflow page.
-        run: |
-          echo "============================================================"
-          echo "⚠️ PIPELINE FAILURE: Deployments aborted to prevent partial rollout"
-          echo "============================================================"
+          echo "## ❌ Jugaad CI/CD Pipeline Failed" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> [!CAUTION]" >> $GITHUB_STEP_SUMMARY
-          echo "> ### ⚠️ Jugaad Pipeline Failure Alert" >> $GITHUB_STEP_SUMMARY
-          echo "> The CI/CD pipeline failed to complete. Remaining deployments were aborted to prevent a partial, inconsistent release state." >> $GITHUB_STEP_SUMMARY
-          echo "> Please check the logs of the failing step to debug." >> $GITHUB_STEP_SUMMARY
-          
-          # Optional: You can integrate other alerts here. For example:
-          # Slack Webhook Notification:
-          # curl -X POST -H 'Content-type: application/json' --data '{"text":"⚠️ Jugaad CI/CD Pipeline Failed! Check GitHub Actions logs."}' ${{ secrets.SLACK_WEBHOOK_URL }}
-          #
-          # Discord Webhook Notification:
-          # curl -X POST -H 'Content-type: application/json' --data '{"content":"⚠️ Jugaad CI/CD Pipeline Failed!"}' ${{ secrets.DISCORD_WEBHOOK_URL }}
+          echo "> ### ⚠️ Deployment Run Failure Alert" >> $GITHUB_STEP_SUMMARY
+          echo "> One or more microservices encountered an error during building, pushing, or deploying." >> $GITHUB_STEP_SUMMARY
+          echo "> Due to the \`fail-fast: true\` configuration, all remaining and pending deployments were aborted to prevent a partial, inconsistent release state." >> $GITHUB_STEP_SUMMARY
+          echo "> Please inspect the failed step logs above to debug." >> $GITHUB_STEP_SUMMARY
